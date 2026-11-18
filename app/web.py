@@ -6,7 +6,11 @@ Serves a single-page console that can
   * fire a real DNS query at the resolver and show the actual reply together
     with where it came from (upstream / cache-fresh / cache-stale / none),
   * show the resolver cache state (with live countdowns) and the query logs
-    of both the resolver and the authoritative endpoint.
+    of both the resolver and the authoritative endpoint,
+  * generate an immutable notification roster for the clients that may have
+    received an old A since a fault start time (sent + 待核实), register which
+    clients have been notified, and diff the roster against the live ledger so
+    newly affected clients and changed entries are visible for follow-up.
 """
 from __future__ import annotations
 
@@ -82,14 +86,32 @@ PAGE = """<!doctype html>
 </section>
 
 <section>
-  <h2>4. 解析器查询日志（最近 15 条）</h2>
+  <h2>4. 故障影响与通知名单</h2>
+  <p class="muted">
+    解析器每发出一条 cache-stale 答复，都会先在 SQLite 记下客户端 IP、地址、时间和唯一查询号，
+    发包后才确认“已发出”；前置写入失败则改答 SERVFAIL，确认缺失（如崩溃）则留作
+    <b>待核实</b>，重启后仍可查。新鲜 A 与 NXDOMAIN 不计入。
+  </p>
+  <p>
+    故障起始时间：<input type="datetime-local" id="faultStart" step="1">
+    &nbsp; <button onclick="genRoster()">按此时间生成通知名单</button>
+    <span id="genmsg"></span>
+  </p>
+  <p class="muted">已有名单：<select id="batchSel" onchange="loadRoster()"></select>
+     &nbsp; <button onclick="loadRoster()">查看</button>
+     <span id="ackmsg"></span></p>
+  <div id="roster"></div>
+</section>
+
+<section>
+  <h2>5. 解析器查询日志（最近 15 条）</h2>
   <table id="rlog"><thead><tr>
     <th>时间</th><th>名称</th><th>类型</th><th>来源</th><th>RCODE</th><th>答复</th><th>说明</th>
   </tr></thead><tbody></tbody></table>
 </section>
 
 <section>
-  <h2>5. 权威端接收日志（最近 15 条）</h2>
+  <h2>6. 权威端接收日志（最近 15 条）</h2>
   <table id="alog"><thead><tr>
     <th>时间</th><th>名称</th><th>类型</th><th>模式</th><th>动作</th><th>说明</th>
   </tr></thead><tbody></tbody></table>
@@ -146,6 +168,117 @@ function fillLog(id, rows, cols) {
     '<tr>' + cols(r).map(x => `<td>${x ?? ''}</td>`).join('') + '</tr>').join('');
 }
 
+// ---- notification roster --------------------------------------------------
+let currentBatch = null;
+
+function fmtFull(ts) {
+  if (ts == null) return '—';
+  return new Date(ts * 1000).toLocaleString('sv-SE');  // YYYY-MM-DD HH:MM:SS
+}
+function fmtLocalInput(ts) {
+  const d = new Date(ts * 1000 - new Date().getTimezoneOffset() * 60000);
+  return d.toISOString().slice(0, 19);
+}
+function stateLabel(st) {
+  return st === 'pending'
+    ? '<span class="bad">待核实</span>'
+    : '<span class="ok">已发出</span>';
+}
+
+async function refreshBatches(selectId) {
+  const r = await (await fetch('/api/notify/batches')).json();
+  const sel = document.getElementById('batchSel');
+  const keep = selectId ?? currentBatch;
+  sel.innerHTML = r.batches.map(b =>
+    `<option value="${b.id}">#${b.id} 起始 ${fmtFull(b.fault_start)}` +
+    ` · 生成 ${fmtFull(b.generated_at)} · ${b.entry_count} 人` +
+    `${b.unacked_count ? ' · 未登记 ' + b.unacked_count : ''}</option>`).join('');
+  if (keep && r.batches.some(b => b.id === keep)) sel.value = keep;
+  return r.batches;
+}
+
+async function genRoster() {
+  const raw = document.getElementById('faultStart').value;
+  if (!raw) { document.getElementById('genmsg').textContent = ' ✘ 请填写故障起始时间'; return; }
+  const ts = new Date(raw).getTime() / 1000;
+  const r = await (await fetch('/api/notify/generate', { method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ fault_start: ts }) })).json();
+  if (!r.ok) { document.getElementById('genmsg').textContent = ' ✘ ' + r.error; return; }
+  document.getElementById('genmsg').textContent =
+    ` ✔ 已生成名单 #${r.batch_id}（${r.entry_count} 人：已发出 ${r.sent_count}，` +
+    `待核实 ${r.unverified_count}）`;
+  currentBatch = r.batch_id;
+  await refreshBatches(r.batch_id);
+  await loadRoster();
+}
+
+async function loadRoster() {
+  const sel = document.getElementById('batchSel');
+  if (!sel.value) { document.getElementById('roster').innerHTML = ''; return; }
+  currentBatch = parseInt(sel.value);
+  const r = await (await fetch(`/api/notify/batch/${currentBatch}`)).json();
+  if (!r.ok) {
+    document.getElementById('roster').innerHTML = '<b class="bad">' + r.error + '</b>';
+    return;
+  }
+  if (!document.getElementById('faultStart').value)
+    document.getElementById('faultStart').value = fmtLocalInput(r.batch.fault_start);
+
+  const rows = r.entries.map(e => {
+    const ack = e.acknowledged_at
+      ? `<span class="ok">已登记 ${fmtFull(e.acknowledged_at)}</span>`
+      : `<button onclick="ack(${e.impact_id})">登记已通知</button>`;
+    const drift = e.change
+      ? `<span class="bad">${e.change}</span>` : '<span class="muted">—</span>';
+    return '<tr>' +
+      `<td>${fmtFull(e.ts)}</td>` +
+      `<td>${e.client_ip}:${e.client_port}</td>` +
+      `<td>${e.stale_a} <span class="muted">ttl=${e.ttl}s</span></td>` +
+      `<td>${stateLabel(e.state_at_snapshot)}</td>` +
+      `<td><code>${e.query_uid}</code></td>` +
+      `<td>${drift}</td>` +
+      '<td>' + ack + '</td></tr>';
+  }).join('');
+
+  const newRows = r.new_impacts.map(i =>
+    '<tr>' +
+    `<td>${fmtFull(i.ts)}</td>` +
+    `<td>${i.client_ip}:${i.client_port}</td>` +
+    `<td>${i.stale_a} <span class="muted">ttl=${i.ttl}s</span></td>` +
+    `<td><code>${i.query_uid}</code></td>` +
+    `<td>${stateLabel(i.state)}</td></tr>`).join('');
+
+  document.getElementById('roster').innerHTML = `
+    <p class="muted">名单 #${r.batch.id} 于 ${fmtFull(r.batch.generated_at)} 生成，
+       覆盖 ${fmtFull(r.batch.fault_start)} 之后至生成时刻的 cache-stale 答复。
+       依据在生成时固化，之后的查询或迟到确认不会改写它。</p>
+    <p class="pill">名单内 ${r.summary.total} 人</p>
+    <p class="pill">已发出 ${r.summary.sent_at_snapshot}</p>
+    <p class="pill">待核实 ${r.summary.unverified_at_snapshot}</p>
+    <p class="pill">已登记通知 ${r.summary.acknowledged}</p>
+    <p class="pill">新增待通知 ${r.summary.new_impacts}</p>
+    <p class="pill">名单内状态变化 ${r.summary.changed}</p>
+    <h3 style="font-size:.92rem">名单（依据为生成时快照）</h3>
+    <table><thead><tr>
+      <th>答复时间</th><th>客户端</th><th>旧 A / TTL</th><th>生成时状态</th>
+      <th>唯一查询号</th><th>之后的变化</th><th>通知登记</th>
+    </tr></thead><tbody>${rows || '<tr><td colspan="7" class="muted">（无）</td></tr>'}</tbody></table>
+    <h3 style="font-size:.92rem">生成名单之后新增的待通知客户端</h3>
+    <table><thead><tr>
+      <th>答复时间</th><th>客户端</th><th>旧 A / TTL</th><th>唯一查询号</th><th>当前状态</th>
+    </tr></thead><tbody>${newRows || '<tr><td colspan="5" class="muted">（无）</td></tr>'}</tbody></table>`;
+}
+
+async function ack(impactId) {
+  const r = await (await fetch(`/api/notify/batch/${currentBatch}/ack`,
+    { method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ impact_id: impactId }) })).json();
+  document.getElementById('ackmsg').textContent = r.ok ? ' ✔ 已登记' : ' ✘ ' + r.error;
+  await refreshBatches(currentBatch);
+  await loadRoster();
+}
+
 async function applyMode() {
   const mode = document.querySelector('input[name=mode]:checked').value;
   const body = { mode, ip: document.getElementById('ip').value,
@@ -176,6 +309,9 @@ async function doQuery() {
 
 setInterval(refresh, 2000);
 refresh();
+if (!document.getElementById('faultStart').value)
+  document.getElementById('faultStart').value = fmtLocalInput(Date.now() / 1000);
+refreshBatches().then(() => { if (document.getElementById('batchSel').value) loadRoster(); });
 </script>
 </body>
 </html>
@@ -186,6 +322,16 @@ class ModeIn(BaseModel):
     mode: str
     ip: str | None = None
     delay_seconds: float | None = None
+
+
+class GenerateIn(BaseModel):
+    fault_start: float
+    note: str | None = None
+
+
+class AckIn(BaseModel):
+    impact_id: int
+    note: str | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -258,6 +404,113 @@ def do_query() -> dict:
         "elapsed_ms": int((time.time() - t0) * 1000),
         "raw": str(rep),
     }
+
+
+def _entry_change(snapshot: dict, live: dict | None) -> str | None:
+    """Describe how a snapshot entry differs from the live ledger row."""
+    if live is None:
+        return "影响记录缺失"
+    if snapshot["state_at_snapshot"] == "pending" and live["state"] == "sent":
+        return "迟到确认：已由待核实转为已发出"
+    if live["state"] != snapshot["state_at_snapshot"]:
+        return f"状态 {snapshot['state_at_snapshot']} → {live['state']}"
+    return None
+
+
+@app.get("/api/notify/batches")
+def notify_batches() -> dict:
+    batches = common.notify_batches()
+    for b in batches:
+        entries = common.notify_entries(b["id"])
+        acks = {a["impact_id"] for a in common.notify_acks(b["id"])}
+        b["entry_count"] = len(entries)
+        b["unacked_count"] = sum(
+            1 for e in entries if e["impact_id"] not in acks
+        )
+    return {"ok": True, "batches": batches}
+
+
+@app.post("/api/notify/generate")
+def notify_generate(g: GenerateIn):
+    now = time.time()
+    if not (g.fault_start > 0):
+        return JSONResponse({"ok": False, "error": "fault_start must be an epoch"},
+                            400)
+    if g.fault_start > now + 1:
+        return JSONResponse({"ok": False, "error": "fault_start is in the future"},
+                            400)
+    batch_id = common.create_notify_batch(g.fault_start, g.note)
+    entries = common.notify_entries(batch_id)
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "entry_count": len(entries),
+        "sent_count": sum(1 for e in entries if e["state_at_snapshot"] == "sent"),
+        "unverified_count": sum(
+            1 for e in entries if e["state_at_snapshot"] == "pending"
+        ),
+    }
+
+
+@app.get("/api/notify/batch/{batch_id}")
+def notify_batch_detail(batch_id: int):
+    batch = common.notify_batch(batch_id)
+    if batch is None:
+        return JSONResponse({"ok": False, "error": "no such batch"}, 404)
+    entries = common.notify_entries(batch_id)
+    ack_map = {a["impact_id"]: a for a in common.notify_acks(batch_id)}
+
+    out = []
+    for e in entries:
+        live = common.stale_impact_by_id(e["impact_id"])
+        out.append({
+            **e,
+            "change": _entry_change(e, live),
+            "acknowledged_at": (ack_map[e["impact_id"]]["acknowledged_at"]
+                                if e["impact_id"] in ack_map else None),
+            "ack_note": (ack_map[e["impact_id"]]["note"]
+                         if e["impact_id"] in ack_map else None),
+        })
+
+    seen = {e["impact_id"] for e in entries}
+    new_impacts = [
+        i for i in common.stale_impacts(since=batch["fault_start"])
+        if i["id"] not in seen
+    ]
+    return {
+        "ok": True,
+        "batch": batch,
+        "entries": out,
+        "new_impacts": new_impacts,
+        "summary": {
+            "total": len(entries),
+            "sent_at_snapshot": sum(
+                1 for e in entries if e["state_at_snapshot"] == "sent"),
+            "unverified_at_snapshot": sum(
+                1 for e in entries if e["state_at_snapshot"] == "pending"),
+            "acknowledged": sum(1 for e in entries if e["impact_id"] in ack_map),
+            "new_impacts": len(new_impacts),
+            "changed": sum(1 for e in out if e["change"]),
+        },
+    }
+
+
+@app.post("/api/notify/batch/{batch_id}/ack")
+def notify_ack(batch_id: int, a: AckIn):
+    if common.notify_batch(batch_id) is None:
+        return JSONResponse({"ok": False, "error": "no such batch"}, 404)
+    ok = common.ack_notify_entry(batch_id, a.impact_id, a.note)
+    if not ok:
+        return JSONResponse(
+            {"ok": False, "error": "impact is not on this roster"}, 400)
+    return {"ok": True}
+
+
+@app.post("/api/notify/batch/{batch_id}/unack")
+def notify_unack(batch_id: int, a: AckIn):
+    if not common.unack_notify_entry(batch_id, a.impact_id):
+        return JSONResponse({"ok": False, "error": "not acknowledged"}, 400)
+    return {"ok": True}
 
 
 def main() -> None:

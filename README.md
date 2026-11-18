@@ -12,7 +12,8 @@
 | `web` | `app.web` | HTTP 8000 | FastAPI 操作网页 |
 
 三者通过共享卷上的 SQLite（WAL 模式）协作：`control` 表存权威端行为，
-`cache` 表存解析器缓存（**绝对时间戳**），`query_log`/`auth_log` 表供网页展示。
+`cache` 表存解析器缓存（**绝对时间戳**），`query_log`/`auth_log` 表供网页展示，
+`stale_impact`/`notify_batch`/`notify_entry`/`notify_ack` 表构成通知依据与名单。
 
 ## 运行
 
@@ -37,6 +38,12 @@ DB_PATH=/tmp/dns/app.db RESOLVER_PORT=15353 WEB_PORT=8000 python -m app.web &
 python tests/selftest.py
 ```
 
+通知名单自测（失败注入、待核实跨重启、快照/登记/差异，约 40 秒）：
+
+```bash
+python tests/notify_selftest.py
+```
+
 ## 语义（默认值，可用环境变量调整）
 
 - 成功答复 TTL = **5 秒**（`FRESH_TTL`），缓存命中时 TTL 倒数。
@@ -58,13 +65,38 @@ additional 段 TXT `_src.<域名>` 中带回），并展示双方日志。
 固定域名默认 `service.example`（`FIXED_DOMAIN` 可改）。解析器只服务该域名，
 其余名称 REFUSED，非 A 查询返回 NODATA。
 
+## 旧 A 影响记录与通知名单
+
+解析器准备发出 **cache-stale**（旧 A）答复时：
+
+1. **先持久记录**：写入 `stale_impact`（客户端 IP/端口、旧 A 地址、时间、唯一查询号
+   `query_uid`），提交成功后才发包；
+2. 发包成功才**确认“已发出”**（`state=sent`，`confirmed_at`）；
+3. **前置写入失败** → 不返回旧 A，改答 **SERVFAIL**（绝不发出无依据的旧 A）；
+4. **确认缺失**（如确认前崩溃）→ 记录留作 **待核实**（`state=pending`），
+   持久在 SQLite 中，**重启仍可查**。
+
+新鲜 A 与 NXDOMAIN 答复**不**写入影响记录，原解析语义不变。
+
+网页第 4 节按**故障起始时间**生成通知名单：把该时刻之后的全部影响记录
+（已发出 + 待核实）**快照**进 `notify_entry`，含逐笔依据（查询号、时间、客户端、
+旧 A、TTL、生成时状态）。依据一经快照**不再改写**；值班员可逐笔“登记已通知”
+（存于独立的 `notify_ack` 表，不触碰快照）。名单生成后：
+
+- 新的 cache-stale 查询 → 页面列出**新增待通知者**；
+- 待核实记录后来补上确认 → 页面在“之后的变化”列指出**状态变化**（原依据不变）。
+
+演练用环境变量 `STALE_LEDGER_FAULT`（`fail-prewrite` / `skip-confirm`）仅用于自测，
+正常运行时留空。
+
 ## 文件
 
 ```
 app/common.py       配置 + SQLite 状态面
 app/auth_server.py  可控权威端（dnslib 编解码，线程并发）
 app/resolver.py     缓存/serve-stale 解析器
-app/web.py          FastAPI 操作网页
+app/web.py          FastAPI 操作网页（含通知名单）
 tests/selftest.py   端到端自测（A–F 六组场景）
+tests/notify_selftest.py 通知名单自测（G–K 五组场景）
 Dockerfile / docker-compose.yml / requirements.txt
 ```

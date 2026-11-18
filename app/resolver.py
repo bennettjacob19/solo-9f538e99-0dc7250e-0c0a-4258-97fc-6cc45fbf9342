@@ -19,6 +19,13 @@ Behaviour (all timings from app.common, defaults are the spec values):
 The resolver reports where each answer came from in an additional-section TXT
 record (_src.<domain> TXT "source=upstream|cache-fresh|cache-stale|none ...")
 and logs every query to the query_log table for the web console.
+
+Every cache-stale answer is also recorded in the stale_impact ledger *before*
+it is sent (client IP/port, stale A address, time, unique query id).  Only
+after sendto() succeeds is the record confirmed as `sent`; if the pre-send
+write fails the client gets SERVFAIL instead of a stale A, and a missing
+confirmation leaves the record `pending` (待核实) durably in SQLite, so a
+restart still shows it.  Fresh A answers and NXDOMAIN are not ledgered.
 """
 from __future__ import annotations
 
@@ -93,8 +100,14 @@ def _reply(query: DNSRecord, rcode: int, answers=(), source="none", detail="") -
     return rep
 
 
-def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
-    """Resolve the fixed domain's A record.  Returns (reply, source, detail)."""
+
+def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str, dict | None]:
+    """Resolve the fixed domain's A record.
+
+    Returns (reply, source, detail, impact).  `impact` is non-None only for a
+    cache-stale answer; it carries the (stale A, TTL) that must be written to
+    the notification ledger before the reply is sent.
+    """
     now = time.time()
     row = common.get_cache()
 
@@ -106,6 +119,7 @@ def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
                    f"fresh_left={row['fresh_until'] - now:.1f}"),
             "cache-fresh",
             "fresh A from cache",
+            None,
         )
     if row and row["rcode"] == "NXDOMAIN" and now < row["fresh_until"]:
         return (
@@ -113,6 +127,7 @@ def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
                    f"fresh_left={row['fresh_until'] - now:.1f}"),
             "cache-fresh",
             "fresh NXDOMAIN from cache",
+            None,
         )
 
     # 2) expired: ask the authoritative endpoint
@@ -128,6 +143,7 @@ def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
                        "upstream"),
                 "upstream",
                 f"fetched A={ips[0]}",
+                None,
             )
 
     if resp is not None and resp.header.rcode == RCODE.NXDOMAIN:
@@ -137,10 +153,12 @@ def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
             _reply(query, RCODE.NXDOMAIN, [], "upstream", "nxdomain-confirmed"),
             "upstream",
             "NXDOMAIN confirmed; old A purged",
+            None,
         )
 
     # 3) upstream timeout / unusable reply: maybe serve the stale A record
-    #    (NXDOMAIN is never served stale).
+    #    (NXDOMAIN is never served stale).  Stale answers are ledgered by the
+    #    caller before they are sent.
     row = common.get_cache()
     if (
         row
@@ -155,13 +173,25 @@ def resolve_a(query: DNSRecord) -> tuple[DNSRecord, str, str]:
                    f"stale_left={row['stale_until'] - now2:.1f}"),
             "cache-stale",
             "upstream timeout; serving stale A",
+            {
+                "stale_a": row["a_record"],
+                "ttl": ttl,
+                "detail": f"upstream-timeout; stale_left={row['stale_until'] - now2:.1f}",
+            },
         )
 
     return (
         _reply(query, RCODE.SERVFAIL, [], "none", "upstream-timeout"),
         "none",
         "upstream timeout; no usable cache",
+        None,
     )
+
+
+def _ledger_fault(which: str) -> None:
+    """Drill-only fault injection, enabled via STALE_LEDGER_FAULT."""
+    if common.STALE_LEDGER_FAULT == which:
+        raise RuntimeError(f"injected ledger fault: {which}")
 
 
 def handle_packet(data: bytes, addr, sock: socket.socket) -> None:
@@ -170,15 +200,46 @@ def handle_packet(data: bytes, addr, sock: socket.socket) -> None:
         query = DNSRecord.parse(data)
         qname = str(query.q.qname)
         qtype = QTYPE[query.q.qtype]
+        uid = None
+        impact = None
         if not _same_name(query.q.qname, common.FQDN):
             rep = _reply(query, RCODE.REFUSED, [], "none", "out-of-scope")
             source, detail = "none", "out-of-scope"
         elif query.q.qtype == QTYPE.A:
-            rep, source, detail = resolve_a(query)
+            rep, source, detail, impact = resolve_a(query)
         else:
             rep = _reply(query, RCODE.NOERROR, [], "none", "nodata")
             source, detail = "none", "nodata"
+
+        if impact is not None:
+            # Pre-send evidence: durable before the client can possibly see the
+            # stale A.  If this write fails, answer SERVFAIL instead -- never
+            # hand out a stale A that the notification roster cannot explain.
+            uid = common.new_query_uid()
+            try:
+                _ledger_fault("fail-prewrite")
+                common.put_stale_impact(uid, addr, qname, qtype,
+                                        impact["stale_a"], impact["ttl"],
+                                        impact["detail"])
+            except Exception:
+                rep = _reply(query, RCODE.SERVFAIL, [], "none",
+                             "ledger-prewrite-failed")
+                source, detail = "none", "stale answer withheld: pre-send write failed"
+                uid = None
+            else:
+                detail = f"{detail}; query_uid={uid}"
+
         sock.sendto(rep.pack(), addr)
+
+        if uid is not None:
+            # Post-send confirmation.  If it is lost (crash, injected fault)
+            # the record stays pending -> 待核实, still visible after restart.
+            try:
+                _ledger_fault("skip-confirm")
+                common.confirm_stale_impact(uid)
+            except Exception:
+                pass
+
         answers = ";".join(
             f"{QTYPE[rr.rtype]}={rr.rdata}(ttl={rr.ttl})" for rr in rep.rr
         ) or "-"
